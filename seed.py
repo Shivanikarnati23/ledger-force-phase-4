@@ -25,10 +25,8 @@ def normalize_emp_id(val):
 def run_seeder():
     print("Starting data seeding from CSV files...")
     
-    # Force drop and recreate the public schema cleanly to bypass foreign key locks
-    with engine.begin() as connection:
-        connection.execute(text("DROP SCHEMA public CASCADE;"))
-        connection.execute(text("CREATE SCHEMA public;"))
+    # Safely drop all existing tables using SQLAlchemy metadata
+    Base.metadata.drop_all(bind=engine)
     
     # Recreate tables fresh with all SQLAlchemy model constraints loaded
     Base.metadata.create_all(bind=engine)
@@ -43,7 +41,7 @@ def run_seeder():
         for col in df_dept.select_dtypes(include=['object', 'str']).columns:
             df_dept[col] = df_dept[col].astype(str).str.strip()
         df_dept = df_dept.drop_duplicates()
-        df_dept.to_sql('departments', con=engine, if_exists='append', index=False)
+        df_dept.to_sql('departments', con=engine, if_exists='append', index=False, method='multi')
         print(f"Seeded departments: {len(df_dept)} rows.")
 
     # 2. Seed Roles
@@ -53,7 +51,7 @@ def run_seeder():
         for col in df_roles.select_dtypes(include=['object', 'str']).columns:
             df_roles[col] = df_roles[col].astype(str).str.strip()
         df_roles = df_roles.drop_duplicates()
-        df_roles.to_sql('roles', con=engine, if_exists='append', index=False)
+        df_roles.to_sql('roles', con=engine, if_exists='append', index=False, method='multi')
         print(f"Seeded roles: {len(df_roles)} rows.")
 
     # 3. Seed Employees
@@ -78,6 +76,7 @@ def run_seeder():
             con=engine, 
             if_exists='append', 
             index=False,
+            method='multi',
             dtype={
                 'employee_id': String(),
                 'first_name': String(),
@@ -104,7 +103,7 @@ def run_seeder():
             df_assign = df_assign.drop_duplicates(subset=['assignment_id'], keep='first')
         else:
             df_assign = df_assign.drop_duplicates()
-        df_assign.to_sql('employee_assignments', con=engine, if_exists='append', index=False)
+        df_assign.to_sql('employee_assignments', con=engine, if_exists='append', index=False, method='multi')
         print(f"Seeded employee_assignments: {len(df_assign)} rows.")
 
     # 5. Seed Salary Components
@@ -130,7 +129,7 @@ def run_seeder():
     valid_comp_cols = ['component_id', 'name', 'type', 'description']
     df_comp = df_comp[[c for c in valid_comp_cols if c in df_comp.columns]]
 
-    df_comp.to_sql('salary_components', con=engine, if_exists='append', index=False)
+    df_comp.to_sql('salary_components', con=engine, if_exists='append', index=False, method='multi')
     print(f"Seeded salary_components: {len(df_comp)} rows.")
 
     # 6. Seed Salary Revisions
@@ -168,12 +167,12 @@ def run_seeder():
         valid_rev_cols = ['revision_id', 'employee_id', 'component_id', 'amount', 'valid_from', 'valid_to', 'reason']
         df_rev = df_rev[[c for c in valid_rev_cols if c in df_rev.columns]]
 
-        df_rev.to_sql('salary_revisions', con=engine, if_exists='append', index=False)
+        df_rev.to_sql('salary_revisions', con=engine, if_exists='append', index=False, method='multi', chunksize=500)
         print(f"Seeded salary_revisions: {len(df_rev)} rows.")
     else:
         print("Skipped salary_revisions.csv: file is empty.")
 
-    # 7. Seed Salary Structures
+    # 7. Seed Salary Structures (Chunked to prevent SQLite parameter limits)
     struct_path = os.path.join(data_dir, "salary_structures.csv")
     if os.path.exists(struct_path) and os.path.getsize(struct_path) > 0:
         df_struct = pd.read_csv(struct_path)
@@ -218,12 +217,72 @@ def run_seeder():
         valid_struct_cols = ['structure_id', 'employee_id', 'component_id', 'base_salary', 'effective_date']
         df_struct = df_struct[[c for c in valid_struct_cols if c in df_struct.columns]]
 
-        df_struct.to_sql('salary_structures', con=engine, if_exists='append', index=False)
+        df_struct.to_sql('salary_structures', con=engine, if_exists='append', index=False, method='multi', chunksize=500)
         print(f"Seeded salary_structures: {len(df_struct)} rows.")
     else:
         print("Skipped salary_structures.csv: file is empty.")
 
-    # 8. Seed Demo Users with Hashed Passwords & Roles (Task 13 Requirement)
+    # 8. Seed Payrolls (Ensures table creation and multiple test rows explicitly)
+    payrolls_path = os.path.join(data_dir, "payrolls.csv")
+    with engine.begin() as conn:
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS payrolls (
+                payroll_run_id VARCHAR PRIMARY KEY,
+                pay_period_start VARCHAR,
+                pay_period_end VARCHAR,
+                total_payout FLOAT,
+                status VARCHAR,
+                created_at VARCHAR
+            );
+        """))
+
+    if os.path.exists(payrolls_path) and os.path.getsize(payrolls_path) > 0:
+        df_payrolls = pd.read_csv(payrolls_path)
+        for col in df_payrolls.select_dtypes(include=['object', 'str']).columns:
+            df_payrolls[col] = df_payrolls[col].astype(str).str.strip()
+        df_payrolls.to_sql('payrolls', con=engine, if_exists='append', index=False, method='multi')
+        print(f"Seeded payrolls: {len(df_payrolls)} rows from CSV.")
+    
+    # Ensure baseline multi-row records exist for testing
+    with engine.begin() as conn:
+        conn.execute(text("""
+            INSERT OR IGNORE INTO payrolls (payroll_run_id, pay_period_start, pay_period_end, total_payout, status, created_at)
+            VALUES 
+            ('PR-2026-11', '2026-11-01', '2026-11-30', 54000.00, 'completed', '2026-11-15 12:00:00'),
+            ('PR-2025-01', '2025-01-01', '2025-04-30', 54000.00, 'completed', '2025-04-15 12:00:00'),
+            ('PR-2024-01', '2024-01-01', '2024-04-30', 54000.00, 'completed', '2024-04-15 12:00:00');
+        """))
+    print("Seeded payrolls: Multiple baseline test rows ensured.")
+
+    # 9. Seed Ledger Entries (Ensures table creation explicitly)
+    ledger_path = os.path.join(data_dir, "ledger_entries.csv")
+    with engine.begin() as conn:
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS ledger_entries (
+                entry_id VARCHAR PRIMARY KEY,
+                account_code VARCHAR,
+                debit FLOAT,
+                credit FLOAT,
+                transaction_date VARCHAR,
+                description VARCHAR
+            );
+        """))
+
+    if os.path.exists(ledger_path) and os.path.getsize(ledger_path) > 0:
+        df_ledger = pd.read_csv(ledger_path)
+        for col in df_ledger.select_dtypes(include=['object', 'str']).columns:
+            df_ledger[col] = df_ledger[col].astype(str).str.strip()
+        df_ledger.to_sql('ledger_entries', con=engine, if_exists='append', index=False, method='multi')
+        print(f"Seeded ledger_entries: {len(df_ledger)} rows.")
+    else:
+        with engine.begin() as conn:
+            conn.execute(text("""
+                INSERT OR IGNORE INTO ledger_entries (entry_id, account_code, debit, credit, transaction_date, description)
+                VALUES ('LEDG-001', '1000', 54000.00, 0.00, '2026-11-15 12:00:00', 'Payroll Disbursement');
+            """))
+        print("Seeded ledger_entries: 1 default test row added.")
+
+    # 10. Seed Demo Users with Hashed Passwords & Roles
     print("Seeding demo user accounts...")
     from app.models import User
     from app.database import SessionLocal
@@ -256,7 +315,7 @@ def run_seeder():
     # Automatically print live database table counts
     print("\n--- Final Database Row Counts ---")
     with engine.connect() as conn:
-        for table_name in ['departments', 'roles', 'employees', 'employee_assignments', 'salary_components', 'salary_revisions', 'salary_structures', 'users']:
+        for table_name in ['departments', 'roles', 'employees', 'employee_assignments', 'salary_components', 'salary_revisions', 'salary_structures', 'payrolls', 'ledger_entries', 'users']:
             try:
                 count = conn.execute(text(f"SELECT count(*) FROM {table_name};")).scalar()
                 print(f"  - {table_name}: {count} rows")

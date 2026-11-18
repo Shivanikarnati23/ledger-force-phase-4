@@ -2,7 +2,7 @@ import sys
 import requests
 
 # Change this to your live public deployment URL once deployed (e.g., https://your-app.onrender.com)
-BASE_URL = "http://localhost:8000"
+BASE_URL = sys.argv[1] if len(sys.argv) > 1 else "http://localhost:8000"
 
 def run_smoke_tests():
     print(f"🚀 Running smoke tests against live target: {BASE_URL}\n")

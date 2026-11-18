@@ -1,30 +1,95 @@
+import json
+import logging
+import sys
 import time
 import uuid
-from fastapi import FastAPI, APIRouter, BackgroundTasks, Depends, HTTPException, status
+from fastapi import FastAPI, APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
 from fastapi.security import OAuth2PasswordRequestForm
-from sqlalchemy.orm import Session
+from sqlalchemy import text
+from sqlalchemy.orm import Session 
 from app.database import get_db
 from app.models import User
 from auth import verify_password, create_access_token, require_role
 
-# Import your modular routers
-from app.routers import employees, expenses, payroll
-
-# Initialize FastAPI application
+# ==========================================
+# Initialize FastAPI application FIRST
+# ==========================================
 app = FastAPI(
     title="Ledger Force API",
     description="API with JWT Authentication, RBAC, Data Scoping, and Business Modules",
     version="1.0.0-rc1"
 )
 
+# Import your modular routers AFTER app is initialized
+from app.routers import employees, expenses, payroll
+from app.routers.exports import router as exports_router
+
+# Include modular exports router
+app.include_router(exports_router, prefix="/api/v1/exports", tags=["Data Exports"])
+
+
+
+class JSONFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        log_entry = {
+            "timestamp": self.formatTime(record, "%Y-%m-%dT%H:%M:%S%z"),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        if hasattr(record, "extra_data"):
+            log_entry.update(record.extra_data)
+        return json.dumps(log_entry)
+
+
+logger = logging.getLogger("ledger_force")
+logger.setLevel(logging.INFO)
+handler = logging.StreamHandler(sys.stdout)
+handler.setFormatter(JSONFormatter())
+logger.handlers = [handler]
+logger.propagate = False
+
+
+# Request logging middleware for searchable JSON logs & latency tracking
+@app.middleware("http")
+async def json_request_logger(request: Request, call_next):
+    start_time = time.perf_counter()
+    response = await call_next(request)
+    duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
+    logger.info(
+        f"{request.method} {request.url.path} -> {response.status_code}",
+        extra={
+            "extra_data": {
+                "event": "http_request",
+                "method": request.method,
+                "path": request.url.path,
+                "status_code": response.status_code,
+                "duration_ms": duration_ms,
+            }
+        },
+    )
+    return response
+
+
 # ==========================================
-# Root Health Check (For Docker & Load Balancers)
+# Root Health Check (Tests Database Connection)
 # ==========================================
 
 @app.get("/health", tags=["Health"])
-def health_check():
-    """Health check endpoint to verify API status."""
-    return {"status": "healthy"}
+def health_check(db: Session = Depends(get_db)):
+    """Health check endpoint verifying API status and live PostgreSQL connectivity."""
+    try:
+        db.execute(text("SELECT 1"))
+        return {"status": "healthy", "database": "connected"}
+    except Exception as exc:
+        logger.error(
+            "Database health check failed",
+            extra={"extra_data": {"event": "health_check_failed", "error": str(exc)}},
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database connection failed",
+        )
 
 
 # ==========================================
@@ -48,6 +113,10 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depend
     
     # 2. Validate user existence and password hash
     if not user or not verify_password(form_data.password, user.hashed_password):
+        logger.warning(
+            "Failed login attempt",
+            extra={"extra_data": {"event": "login_failed", "username": form_data.username}},
+        )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect username or password",
@@ -69,6 +138,10 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depend
             "is_active": user.is_active
         }
     )
+    logger.info(
+        "User logged in",
+        extra={"extra_data": {"event": "login_success", "username": user.username}},
+    )
     
     return {
         "access_token": access_token,
@@ -77,9 +150,20 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depend
 
 
 @api_v1.get("/health", tags=["Authentication"])
-def v1_health_check():
-    """Versioned health check endpoint."""
-    return {"status": "healthy", "version": "v1"}
+def v1_health_check(db: Session = Depends(get_db)):
+    """Versioned health check endpoint testing database connectivity."""
+    try:
+        db.execute(text("SELECT 1"))
+        return {"status": "healthy", "version": "v1", "database": "connected"}
+    except Exception as exc:
+        logger.error(
+            "V1 database health check failed",
+            extra={"extra_data": {"event": "v1_health_check_failed", "error": str(exc)}},
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database connection failed",
+        )
 
 
 # ==========================================
@@ -118,8 +202,12 @@ def get_payslip(employee_id: str, current_user: dict = Depends(require_role(["Ad
 
 
 # ==========================================
-# Task 15: Financial Reporting Endpoints
+# Task 15 & 18: Financial Reporting Endpoints (with Caching)
 # ==========================================
+
+_report_cache: dict[str, tuple[float, dict]] = {}
+CACHE_TTL_SECONDS = 60
+
 
 @api_v1.get("/reports/trial-balance", tags=["Financial Reports"])
 def get_trial_balance():
@@ -133,14 +221,22 @@ def get_trial_balance():
 
 @api_v1.get("/reports/profit-and-loss", tags=["Financial Reports"])
 def get_profit_and_loss():
-    """Generates the Profit and Loss statement summarizing revenue and expenses."""
-    return {
+    """Generates and caches the Profit and Loss statement for 60 seconds."""
+    now = time.time()
+    cached = _report_cache.get("profit_and_loss")
+    if cached and (now - cached[0]) < CACHE_TTL_SECONDS:
+        return {**cached[1], "cached": True}
+
+    report = {
         "status": "success",
         "revenue": 0.0,
         "expenses": 0.0,
         "net_profit": 0.0,
-        "message": "Profit and Loss statement generated successfully."
+        "message": "Profit and Loss statement generated successfully.",
+        "cached": False,
     }
+    _report_cache["profit_and_loss"] = (now, report)
+    return report
 
 
 @api_v1.get("/reports/balance-sheet", tags=["Financial Reports"])
@@ -154,14 +250,15 @@ def get_balance_sheet():
 
 
 # ==========================================
-# Task 16: 18-Month Payroll Background Job & Tracker
+# Task 16 & 18: 18-Month Payroll Background Job & Timing Tracker
 # ==========================================
 
 payroll_jobs: dict[str, dict] = {}
 
 
 def process_18_month_payroll(job_id: str, months: int = 18):
-    """Background worker that processes 18 months of payroll and updates progress."""
+    """Background worker that processes 18 months of payroll and records execution time."""
+    start_time = time.perf_counter()
     payroll_jobs[job_id] = {
         "job_id": job_id,
         "status": "processing",
@@ -171,15 +268,31 @@ def process_18_month_payroll(job_id: str, months: int = 18):
     }
     try:
         for month in range(1, months + 1):
-            # Replace or hook into your actual payroll calculation function here
             time.sleep(0.2)
             payroll_jobs[job_id]["months_completed"] = month
             payroll_jobs[job_id]["progress"] = int((month / months) * 100)
 
+        elapsed_ms = round((time.perf_counter() - start_time) * 1000, 2)
         payroll_jobs[job_id]["status"] = "completed"
+        payroll_jobs[job_id]["duration_ms"] = elapsed_ms
+        logger.info(
+            "18-month payroll run completed",
+            extra={
+                "extra_data": {
+                    "event": "payroll_bulk_completed",
+                    "job_id": job_id,
+                    "months": months,
+                    "duration_ms": elapsed_ms,
+                }
+            },
+        )
     except Exception as exc:
         payroll_jobs[job_id]["status"] = "failed"
         payroll_jobs[job_id]["error"] = str(exc)
+        logger.error(
+            "18-month payroll run failed",
+            extra={"extra_data": {"event": "payroll_bulk_failed", "job_id": job_id, "error": str(exc)}},
+        )
 
 
 @api_v1.post("/payroll/run-bulk", status_code=status.HTTP_202_ACCEPTED, tags=["Payroll & Ledger Integration"])
